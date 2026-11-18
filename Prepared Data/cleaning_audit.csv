@@ -1,0 +1,20 @@
+stage,count
+Source track rows,586672
+Source artist rows,1162095
+Track rows released in 2018-2020,36780
+Distinct valid track IDs,36780
+Missing or invalid danceability,0
+Missing or invalid energy,0
+Missing or invalid valence,0
+Missing or invalid acousticness,0
+Tracks with malformed credit lists excluded,0
+Tracks without credited artist IDs excluded,0
+Exact catalogue variants collapsed,975
+Retained recordings,35805
+Distinct artist-track credits,53994
+Artists in primary sample,18401
+Artists with unknown follower counts,3346
+Superstars,1506
+H3 artists with three complete audio tracks,4900
+H3 reference artists,395
+H3 eligible superstars,1005
