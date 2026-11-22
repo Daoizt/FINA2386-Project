@@ -1,0 +1,470 @@
+---
+title: "H2 Structural Brokerage and Spotify Popularity"
+subtitle: "Original model specification on cleaned 2018–2020 recordings"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: tectonic
+fontsize: 10pt
+geometry: margin=0.8in
+mainfont: Arial
+params:
+  data_dir: null
+  output_dir: "output"
+---
+
+```{r h2-setup, include=FALSE}
+
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE,
+                      fig.align="center", out.width="100%")
+library_candidates <- c("../../.r-library", "../.r-library", ".r-library")
+for (candidate in library_candidates) {
+  if (dir.exists(candidate)) .libPaths(c(normalizePath(candidate), .libPaths()))
+}
+
+```
+
+# Research question
+
+H2 predicts that artists who bridge collaboration groups have more followers but
+lower average track popularity. We test the two outcomes separately and assess
+whether the result depends on selecting already-popular recordings.
+
+# Data and methodology
+
+The primary sample uses the cleaned 2018–2020 catalogue across the full popularity
+range. The sensitivity sample retains popularity scores of at least 65 **after**
+catalogue deduplication. Networks and artist summaries are rebuilt within each
+sample.
+
+An artist–track bipartite network is projected onto artists. Each undirected
+artist pair has one edge, weighted by shared recording count. For this original
+H2 specification, we retain the largest connected component and measure brokerage
+as **1 divided by weighted Burt constraint**. Weighted eigenvector centrality,
+track count, and mean danceability are controls. Artist summaries include
+retained solo recordings. Both models use the same complete-case artists with
+positive observed follower counts.
+
+\[
+\log(Followers_i) = \alpha + \beta Brokerage_i +
+\gamma Eigenvector_i + \delta TrackCount_i +
+\theta Danceability_i + \epsilon_i
+\]
+
+\[
+AveragePopularity_i = \alpha + \beta Brokerage_i +
+\gamma Eigenvector_i + \delta TrackCount_i +
+\theta Danceability_i + \epsilon_i
+\]
+
+We report two-sided HC1 tests and nominal 95% confidence intervals. Holm
+adjustments cover the two H2 outcomes separately within each sample.
+A combined H1–H3 report requires its own agreed primary-test family.
+
+# Reproducible analysis
+
+All sample construction, regression, export and figure code is embedded below.
+The document can be knitted without the separate R script.
+
+```{r h2-analysis, include=FALSE}
+
+# Standalone script containing all H2 analysis and figure code.
+# CLI: Rscript "H2 Local Run/Paper Style/run_h2_paper.R" [prepared_data_dir] [output_dir]
+# Integration: source this file, then call run_h2_paper(data_dir, output_dir).
+run_h2_paper <- function(data_dir, output_dir) {
+  for (package in c('data.table','igraph','sandwich')) {
+    if (!requireNamespace(package, quietly=TRUE)) stop('Install R package: ', package)
+    suppressPackageStartupMessages(library(package, character.only=TRUE))
+  }
+  # 01_build_sample.R
+  build_h2_sample <- function(key,tracks,artists,credits) {
+    message('Building H2 sample: ',key)
+    selected <- if(key=='full')tracks else tracks[popularity>=65]
+    a <- credits[track_id %chin% selected$id,.(artist_id,track_id)]
+    vertices <- data.frame(name=c(paste0('A:',unique(a$artist_id)),paste0('T:',selected$id)),
+      type=c(rep(FALSE,uniqueN(a$artist_id)),rep(TRUE,nrow(selected))))
+    bip <- graph_from_data_frame(data.frame(from=paste0('A:',a$artist_id),to=paste0('T:',a$track_id)),
+      directed=FALSE,vertices=vertices)
+    projection <- bipartite_projection(bip,which='false',multiplicity=TRUE)
+    stopifnot(is_simple(projection),!is_directed(projection),all(E(projection)$weight>=1))
+    comp <- components(projection)
+    g <- induced_subgraph(projection,which(comp$membership==which.max(comp$csize)))
+    stopifnot(is_connected(g))
+    ids <- substring(V(g)$name,3)
+    stats <- data.table(artist_id=ids,
+      constraint=as.numeric(constraint(g,weights=E(g)$weight)),
+      eigenvector=as.numeric(eigen_centrality(g,weights=E(g)$weight)$vector),
+      degree=as.numeric(degree(g)))
+    stats[,structural_holes:=1/constraint]
+    values <- merge(a,selected[,.(track_id=id,popularity,danceability)],by='track_id')
+    profiles <- values[,.(song_count=.N,avg_popularity=mean(popularity),
+      avg_danceability=mean(danceability)),by=artist_id]
+    d <- merge(merge(stats,profiles,by='artist_id'),artists[,.(artist_id=id,name,followers)],by='artist_id')
+    d <- d[is.finite(followers)&followers>0&is.finite(structural_holes)&
+      is.finite(eigenvector)&is.finite(avg_popularity)&is.finite(avg_danceability)]
+    summary <- data.table(sample=key,recordings=nrow(selected),credited_artists=uniqueN(a$artist_id),
+      projection_edges=ecount(projection),components=comp$no,
+      giant_artists=vcount(g),giant_edges=ecount(g),model_artists=nrow(d),
+      brokerage_q25=quantile(d$structural_holes,.25),brokerage_q75=quantile(d$structural_holes,.75))
+    list(key=key,graph=g,data=d,credits=a,tracks=selected,artists=artists,summary=summary)
+  }
+  
+
+  # 02_models.R
+  fit_h2_models <- function(sample) {
+    data <- sample$data
+    formulas <- list(
+      log_followers=log(followers)~structural_holes+eigenvector+song_count+avg_danceability,
+      avg_popularity=avg_popularity~structural_holes+eigenvector+song_count+avg_danceability)
+    models <- lapply(formulas,function(formula)lm(formula,data=data))
+    coefficients <- rbindlist(lapply(names(models),function(outcome) {
+      model <- models[[outcome]]
+      beta <- coef(model)
+      se <- sqrt(diag(sandwich::vcovHC(model,type='HC1')))
+      df <- df.residual(model)
+      stopifnot(nobs(model)==nrow(data),all(is.finite(beta)),all(is.finite(se)))
+      # Check sandwich HC1 against its direct matrix expression.
+      x <- model.matrix(model)
+      inverse <- solve(crossprod(x))
+      direct <- inverse %*% crossprod(x*residuals(model)) %*% inverse*nrow(x)/(nrow(x)-ncol(x))
+      stopifnot(max(abs(direct-sandwich::vcovHC(model,type='HC1')))<1e-7)
+      data.table(hypothesis='H2',sample=sample$key,primary=sample$key=='full',outcome,
+        term=names(beta),estimate=as.numeric(beta),standard_error=as.numeric(se),
+        ci_low=as.numeric(beta-qt(.975,df)*se),ci_high=as.numeric(beta+qt(.975,df)*se),
+        p_value=as.numeric(2*pt(-abs(beta/se),df)),n=nobs(model),
+        adjusted_r2=summary(model)$adj.r.squared,method='OLS HC1 two-sided')
+    }))
+    list(models=models,coefficients=coefficients)
+  }
+  
+
+  # 03_figures.R
+  draw_h2_figures <- function(samples,analyses,estimates,output) {
+    save_figure <- function(id,width,height,draw) {
+      cairo_pdf(file.path(output,paste0(id,'.pdf')),width=width,height=height,family='Arial')
+      tryCatch(draw(),finally=dev.off())
+      png(file.path(output,paste0(id,'.png')),width=width*200,height=height*200,res=200,type='cairo')
+      tryCatch(draw(),finally=dev.off())
+    }
+    blue <- '#00649B'
+    orange <- '#B14F1B'
+    full <- samples$full
+    # Choose a transparent five-artist example from real duet credits. Alter
+    # artists have no pairwise ties in the complete primary collaboration graph.
+    duets <- full$credits[,if(.N==2L).(artist_id),by=track_id]
+    pairs <- duets[,.(left=artist_id[1],right=artist_id[2]),by=track_id]
+    pairs <- rbind(pairs,pairs[,.(track_id,left=right,right=left)])
+    candidates <- full$data[degree>=4][order(-structural_holes,artist_id),artist_id]
+    chosen <- NULL
+    for (broker in candidates) {
+      alters <- unique(pairs[left==broker,right])
+      named_artists <- full$artists[!is.na(name) & nzchar(name),id]
+      alters <- alters[alters %chin% named_artists]
+      selected <- character()
+      for (artist in sort(alters)) {
+        if (!paste0('A:',artist) %in% V(full$graph)$name) next
+        adjacent <- substring(as_ids(neighbors(full$graph,paste0('A:',artist))),3)
+        if(any(selected %chin% adjacent)) next
+        selected <- c(selected,artist)
+        if(length(selected)==4L) break
+      }
+      if(length(selected)==4L) {
+        chosen <- pairs[left==broker & right %chin% selected][order(track_id)][,head(.SD,1),by=right]
+        break
+      }
+    }
+    if(is.null(chosen)) stop('No suitable illustrative broker found.')
+    selected_ids <- c(broker,chosen$right)
+    display <- duets[track_id %chin% chosen$track_id]
+    net <- graph_from_data_frame(data.frame(from=paste0('A:',display$artist_id),to=paste0('T:',display$track_id)),FALSE)
+    V(net)$type <- startsWith(V(net)$name,'T:')
+    projected <- bipartite_projection(net,which='false')
+    stopifnot(vcount(projected)==5L,ecount(projected)==4L)
+    names_artist <- setNames(full$artists$name,full$artists$id)
+    names_track <- setNames(full$tracks$name,full$tracks$id)
+    fwrite(display,file.path(output,'h2_display_credits.csv'))
+    fwrite(data.table(artist_id=selected_ids,name=names_artist[selected_ids],
+      role=ifelse(selected_ids==broker,'Focal broker','Collaborator')),
+      file.path(output,'h2_display_artists.csv'))
+    short <- function(x,n=27) ifelse(nchar(x)>n,paste0(substr(x,1,n-3),'...'),x)
+    save_figure('H2_F1_networks',11,4.8,function() {
+      layout(matrix(c(1,2),ncol=2))
+      par(mar=c(3,1,3,1),xaxs='i',yaxs='i')
+      plot.new();plot.window(c(0,1),c(0,1))
+      title('A  Artist-track affiliations',adj=0,cex.main=1)
+      artist_y <- setNames(c(.5,.86,.66,.34,.14),selected_ids)
+      track_y <- setNames(seq(.85,.15,length.out=4),chosen$track_id)
+      segments(.40,artist_y[display$artist_id],.59,track_y[display$track_id],col='#9BADB8')
+      points(rep(.40,5),artist_y,pch=21,bg=c(blue,rep('#71818C',4)),col='white',cex=1.8)
+      points(rep(.59,4),track_y,pch=22,bg='#BBC7CE',cex=1.1)
+      text(.37,artist_y,short(names_artist[selected_ids],23),adj=1,cex=.70)
+      text(.62,track_y,short(names_track[names(track_y)],27),adj=0,cex=.70)
+      mtext('Five artists; four retained duet recordings',side=1,line=1,cex=.72)
+      plot.new();plot.window(c(0,1),c(0,1))
+      title('B  Artist collaboration projection',adj=0,cex.main=1)
+      x <- c(.5,.22,.78,.22,.78);y <- c(.5,.82,.82,.18,.18)
+      segments(x[1],y[1],x[-1],y[-1],col='#9BADB8',lwd=1.5)
+      points(x,y,pch=21,bg=c(blue,rep('#71818C',4)),col='white',cex=2)
+      text(x,y+c(-.08,.07,.07,-.07,-.07),short(names_artist[selected_ids],23),cex=.72)
+      mtext('Illustrative subset; the highlighted artist connects four unconnected alters',side=1,line=1,cex=.65)
+    })
+    save_figure('H2_F2_coefficients',11,4.3,function() {
+      par(mfrow=c(1,2),mar=c(5,7,3,1),oma=c(2,0,0,0))
+      for(target in c('log_followers','avg_popularity')) {
+        rows <- estimates[outcome==target]
+        bounds <- range(c(0,rows$ci_low,rows$ci_high))
+        plot(NA,xlim=bounds+c(-.08,.08)*diff(bounds),ylim=c(.6,2.4),yaxt='n',ylab='',bty='n',
+          xlab='Brokerage coefficient with 95% HC1 interval',
+          main=if(target=='log_followers')'A  Log followers' else 'B  Average popularity',cex.main=1)
+        abline(v=0,col='#9BADB8',lty=2)
+        axis(2,at=c(2,1),labels=c('Full sample','Popularity >=65'),las=1,tick=FALSE,cex.axis=.8)
+        segments(rows$ci_low,c(2,1),rows$ci_high,c(2,1),col=c(blue,orange),lwd=2)
+        points(rows$estimate,c(2,1),pch=19,col=c(blue,orange),cex=1.2)
+      }
+      mtext('Networks and artist summaries are reconstructed separately within each sample.',outer=TRUE,side=1,line=.4,cex=.75)
+    })
+    predictions <- list()
+    save_figure('H2_F3_adjusted_predictions',11,6.8,function() {
+      par(mfrow=c(2,2),mar=c(4.8,4.5,3,1))
+      for(key in c('full','popular')) {
+        d <- samples[[key]]$data
+        for(outcome in c('log_followers','avg_popularity')) {
+          model <- analyses[[key]]$models[[outcome]]
+          grid <- data.frame(structural_holes=seq(quantile(d$structural_holes,.10),
+            quantile(d$structural_holes,.90),length.out=100),
+            eigenvector=mean(d$eigenvector),song_count=mean(d$song_count),avg_danceability=mean(d$avg_danceability))
+          x <- model.matrix(delete.response(terms(model)),grid)
+          fitted <- as.numeric(x%*%coef(model))
+          se <- sqrt(rowSums((x%*%sandwich::vcovHC(model,type='HC1'))*x))
+          delta <- qt(.975,df.residual(model))*se
+          color <- if(key=='full')blue else orange
+          plot(grid$structural_holes,fitted,type='n',ylim=range(fitted-delta,fitted+delta),
+            xlab='Brokerage (1 / weighted constraint)',ylab=if(outcome=='log_followers')'Predicted log followers' else 'Predicted mean popularity',
+            main=paste(if(key=='full')'Full sample' else 'Popularity >=65',
+              if(outcome=='log_followers')' / followers' else ' / popularity'),cex.main=.95,bty='l')
+          polygon(c(grid$structural_holes,rev(grid$structural_holes)),c(fitted-delta,rev(fitted+delta)),
+            border=NA,col=adjustcolor(color,alpha.f=.15))
+          lines(grid$structural_holes,fitted,col=color,lwd=2)
+          predictions[[paste(key,outcome)]] <<- data.table(sample=key,outcome,brokerage=grid$structural_holes,
+            prediction=fitted,ci_low=fitted-delta,ci_high=fitted+delta)
+        }
+      }
+    })
+    fwrite(rbindlist(predictions),file.path(output,'h2_predictions.csv'))
+  }
+  
+
+  # 04_exports.R
+  export_h2_text <- function(samples,coefficients,estimates,output) {
+    cells <- function(sample_key,outcome_key,term_key) {
+      row <- coefficients[sample==sample_key & outcome==outcome_key & term==term_key]
+      stopifnot(nrow(row)==1L)
+      sprintf('%.3f (%.3f)',row$estimate,row$standard_error)
+    }
+    terms <- c('(Intercept)','structural_holes','eigenvector','song_count','avg_danceability')
+    labels <- c('Intercept','Brokerage (1 / constraint)','Eigenvector centrality','Track count','Mean danceability')
+    lines <- c('# H2 regression table','',
+      '| Predictor | Full: log followers | Full: popularity | Popular: log followers | Popular: popularity |',
+      '|---|---:|---:|---:|---:|')
+    for(i in seq_along(terms)) lines <- c(lines,paste0('| ',labels[i],' | ',
+      paste(c(cells('full','log_followers',terms[i]),cells('full','avg_popularity',terms[i]),
+        cells('popular','log_followers',terms[i]),cells('popular','avg_popularity',terms[i])),collapse=' | '),' |'))
+    columns <- coefficients[term=='structural_holes']
+    lines <- c(lines,paste0('| N | ',paste(columns$n,collapse=' | '),' |'),
+      paste0('| Adjusted R-squared | ',paste(sprintf('%.3f',columns$adjusted_r2),collapse=' | '),' |'),'',
+      'HC1 standard errors in parentheses. Two-sided tests. Popular sample retains popularity >=65 after catalogue deduplication.')
+    writeLines(lines,file.path(output,'h2_regression_table.md'))
+    text <- c('# H2 manuscript insert','',
+      '## Methods','',
+      'We tested whether structural brokerage is associated with larger fanbases and lower mean track popularity. Using the cleaned 2018-2020 catalogue, we constructed artist-track affiliations and projected them into a weighted artist collaboration network. Edge weights count shared recordings. Within each sample we retained the largest connected component and measured brokerage as the reciprocal of weighted Burt constraint. We regressed log followers and mean track popularity on brokerage, weighted eigenvector centrality, track count and mean danceability. Artist averages include retained solo tracks. Both models use the same complete-case sample with positive observed followers. We report HC1 robust standard errors and two-sided tests. The primary sample covers the full popularity range; a sensitivity analysis reconstructs the network using tracks with popularity >=65.','',
+      '## Results','',
+      'The primary regressions included 5,642 artists. Brokerage was positively associated with log followers (coefficient 0.256, 95% CI [0.216, 0.296]) and mean popularity (1.383, 95% CI [1.243, 1.522]). The proposed popularity penalty was therefore unsupported in the full sample. In the high-popularity sample of 1,348 artists, brokerage remained positively associated with log followers (0.160, 95% CI [0.111, 0.210]) but negatively associated with mean popularity (-0.224, 95% CI [-0.302, -0.146]). All four two-sided HC1 p-values were below .001. The trade-off depends on restricting the analysis to already-popular recordings.','',
+      '## Interpretation and limitations','',
+      'Filtering changes the graph, artist cohort and outcomes being averaged, so this comparison does not identify the mechanism behind the sign reversal. Structural brokerage does not establish genre crossover. Snapshot followers cannot measure growth, and HC1 does not fully address dependence among collaborators. These results describe conditional associations.','',
+      '## Integration notes','',
+      'Use h2_coefficients.csv and h2_estimates.csv for combined H1-H3 tables. The hypothesis column is H2, sample is full or popular, and primary identifies the full sample. Keep p_value as the unadjusted two-sided value when applying a project-wide correction. p_holm_h2 in h2_estimates.csv adjusts only the two outcomes within each sample. Cite H2_F1, H2_F2 and H2_F3 as placeholders and renumber them in the final manuscript. This insert is approximately 300 words and should be shortened to fit the group write-up.','',
+      'The manuscript figures show illustrative networks and model results. Do not interpret displayed artists as the complete regression sample.')
+    writeLines(text,file.path(output,'h2_manuscript_insert.md'))
+  }
+  
+  dir.create(output_dir,recursive=TRUE,showWarnings=FALSE)
+  tracks <- fread(file.path(data_dir,'tracks_clean.csv'),encoding='UTF-8')
+  artists <- fread(file.path(data_dir,'artists_clean.csv'),encoding='UTF-8')
+  credits <- fread(file.path(data_dir,'artist_track_credits.csv'),encoding='UTF-8')
+  stopifnot(!anyDuplicated(tracks$id),!anyDuplicated(artists$id),
+    !anyDuplicated(credits[,.(artist_id,track_id)]),all(tracks$year %between% c(2018,2020)),
+    all(credits$track_id %chin% tracks$id),all(credits$artist_id %chin% artists$id))
+  samples <- lapply(c('full','popular'),function(key) build_h2_sample(key,tracks,artists,credits))
+  names(samples) <- c('full','popular')
+  analyses <- lapply(samples,fit_h2_models)
+  summary <- rbindlist(lapply(samples,function(x)x$summary))
+  coefficients <- rbindlist(lapply(analyses,function(x)x$coefficients))
+  estimates <- coefficients[term=='structural_holes']
+  estimates[,p_holm_h2:=p.adjust(p_value,method='holm'),by=sample]
+  fwrite(summary,file.path(output_dir,'h2_samples.csv'))
+  fwrite(coefficients,file.path(output_dir,'h2_coefficients.csv'))
+  fwrite(estimates,file.path(output_dir,'h2_estimates.csv'))
+  for (key in names(samples)) fwrite(samples[[key]]$data,file.path(output_dir,paste0('h2_',key,'_model_data.csv')))
+  saveRDS(lapply(analyses,function(x)x$models),file.path(output_dir,'h2_models.rds'))
+  draw_h2_figures(samples,analyses,estimates,output_dir)
+  export_h2_text(summary,coefficients,estimates,output_dir)
+  manifest <- data.table(file=c('tracks_clean.csv','artists_clean.csv','artist_track_credits.csv'))
+  manifest[,md5:=unname(tools::md5sum(file.path(data_dir,file))) ]
+  fwrite(manifest,file.path(output_dir,'h2_input_checksums.csv'))
+  writeLines(capture.output(sessionInfo()),file.path(output_dir,'h2_session_info.txt'))
+  invisible(list(samples=summary,coefficients=coefficients,estimates=estimates))
+}
+
+
+
+input_candidates <- c("../Prepared Data",
+  "../../tmp/H2-repository-2026-11-22/Prepared Data",
+  "../../Spotify Artist Collaboration/Prepared Data")
+input_dir <- params$data_dir
+if (is.null(input_dir)) {
+  available <- input_candidates[dir.exists(input_candidates)]
+  if (!length(available)) stop("Set `params$data_dir` to the Prepared Data folder.")
+  input_dir <- available[1]
+}
+input_dir <- normalizePath(input_dir, winslash="/", mustWork=TRUE)
+out_dir <- params$output_dir
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+out_dir <- normalizePath(out_dir, winslash="/", mustWork=TRUE)
+h2 <- run_h2_paper(input_dir, out_dir)
+h2_read <- function(file) data.table::fread(file.path(out_dir, file))
+h2_fmt_p <- function(p) ifelse(p < .001, "<.001", sprintf("%.3f", p))
+h2_focal <- function(sample_key, outcome_key) {
+  row <- h2$estimates[sample==sample_key & outcome==outcome_key]
+  sprintf("%.3f", row$estimate)
+}
+
+```
+
+## Sample accounting
+
+```{r h2-samples}
+
+display <- as.data.frame(h2$samples[, .(sample, recordings, credited_artists,
+                                       giant_artists, giant_edges, model_artists)])
+names(display) <- c("Sample", "Recordings", "Credited artists",
+                    "Component artists", "Component edges", "Model N")
+knitr::kable(display, caption="H2 sample construction")
+
+```
+
+# Network illustration
+
+```{r h2-network}
+
+knitr::include_graphics(file.path(out_dir, "H2_F1_networks.png"), rel_path=FALSE)
+
+```
+
+**H2_F1.** A high-brokerage artist and four duet partners illustrate the
+relationship between affiliations and their artist projection. The partners have
+no pairwise ties in the full primary collaboration network. Each displayed
+artist pair shares one selected retained duet. The analysis uses complete
+eligible network positions; this small example explains the measure.
+Blue identifies the focal broker and gray identifies collaborators.
+
+\newpage
+
+# Regression results
+
+## Brokerage estimates
+
+```{r h2-estimates}
+
+r <- h2$estimates
+display <- data.frame(
+  Sample=r$sample,
+  Outcome=r$outcome,
+  Coefficient=sprintf("%.3f",r$estimate),
+  HC1_SE=sprintf("%.3f",r$standard_error),
+  CI=paste0("[",sprintf("%.3f",r$ci_low),", ",sprintf("%.3f",r$ci_high),"]"),
+  Raw_p=h2_fmt_p(r$p_value),
+  H2_Holm_p=h2_fmt_p(r$p_holm_h2),
+  N=r$n)
+knitr::kable(display,caption="H2 focal coefficients and uncertainty")
+
+```
+
+In the primary sample, brokerage is positively associated with log followers
+(coefficient `r h2_focal('full','log_followers')`) and mean
+popularity (`r h2_focal('full','avg_popularity')`).
+The popularity-penalty prediction is therefore unsupported in the primary analysis.
+In the popularity >=65 subset, the follower coefficient is
+`r h2_focal('popular','log_followers')`, while the popularity
+coefficient is `r h2_focal('popular','avg_popularity')`.
+The proposed trade-off appears within the high-popularity subset.
+
+```{r h2-coefficient-figure}
+
+knitr::include_graphics(file.path(out_dir, "H2_F2_coefficients.png"), rel_path=FALSE)
+
+```
+
+**H2_F2.** Points are brokerage coefficients and lines are nominal 95% HC1
+intervals. The dashed line is zero. Each sample has a separate reconstructed
+network and artist-level outcome summaries.
+
+## Complete model table
+
+```{r h2-full-table, results='asis'}
+
+table_text <- readLines(file.path(out_dir,"h2_regression_table.md"))
+cat(paste(table_text[!startsWith(table_text,"# ")],collapse="\n"),"\n")
+
+```
+
+## Adjusted prediction plots
+
+```{r h2-prediction-figure}
+
+knitr::include_graphics(file.path(out_dir, "H2_F3_adjusted_predictions.png"), rel_path=FALSE)
+
+```
+
+**H2_F3.** Curves use the fitted multiple-regression models, holding controls at
+their sample means. Brokerage ranges from the sample's 10th to 90th percentile.
+Shading is a pointwise nominal 95% HC1 interval for the conditional fitted mean.
+Follower panels use the natural-log scale.
+
+# Interpretation and limitations
+
+The full-catalogue analysis does not support a general popularity penalty for
+brokerage. Selecting already-popular recordings changes the network, artist
+cohort and tracks being averaged. These runs cannot identify the mechanism behind
+the sign reversal.
+
+The predictor measures structural brokerage. A separate genre-tag analysis is
+needed to establish genre crossover. Followers and popularity are snapshot
+measures, so these models do not establish causal effects or follower growth.
+HC1 addresses heteroskedasticity but does not fully account for dependence among
+collaborators. Alternative brokerage measures, influential observations and
+dependence-aware inference remain further work.
+
+# Merge with H1 and H3
+
+Copy the narrative sections into the combined report and renumber H2_F1–H2_F3.
+The analysis exports estimates with consistent hypothesis, sample, outcome, term,
+coefficient, uncertainty and sample-size fields. Use the unadjusted p_value
+column for any project-wide correction.
+
+This document creates outputs in the folder specified by `params$output_dir`.
+Set `params$data_dir` when the prepared data are stored elsewhere.
+The same analysis can be run by the separate standalone R script.
+
+# Methods references
+
+- [igraph bipartite projection](https://r.igraph.org/reference/bipartite_projection.html)
+- [igraph Burt constraint](https://r.igraph.org/reference/constraint.html)
+- [sandwich covariance estimators](https://sandwich.r-forge.r-project.org/reference/index.html)
+
+# Reproducibility record
+
+```{r h2-session}
+sessionInfo()
+```
