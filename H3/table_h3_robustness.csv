@@ -1,0 +1,7 @@
+Model_Specification,Sample_Parameter,Beta,HC3_SE,p_value
+Baseline Primary Model,">= 3 tracks (N = 1,005)",1.755,0.628,0.005
+Stricter Track Threshold,>= 5 tracks (N =   758),1.739,0.689,0.012
+High-Output Superstars,>= 10 tracks (N =   410),2.191,1.068,0.041
+Non-Reference Artists Only,Excl. ref. group (N = 709),1.857,0.716,0.01
+k-NN Network Centrality,"k = 10 neighbors (N = 1,005)",4.944,1.928,0.01
+k-NN Network Centrality,"k = 15 neighbors (N = 1,005)",4.601,1.853,0.013
